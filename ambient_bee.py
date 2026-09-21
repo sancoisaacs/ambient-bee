@@ -589,7 +589,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="🐝 Ambient Bee v2 — DIY ambient memory for Termux",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent("""\
+        epilog="Use --setup to get started. Repo: https://github.com/sancoisaacs/ambient-bee",
             Examples:
               python ambient_bee.py --setup              check & install deps
               python ambient_bee.py --run-once           process + sync + exit  ← cron/widget
