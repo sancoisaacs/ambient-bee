@@ -146,8 +146,8 @@ export BEE_HOME=/some/path
 
 Speak naturally, then:
 
-- *"bee todo call Jeff about the MBR"* → todo #N, flagged 🐝 explicit
-- *"bee remember Gwen wants red columns first"* → kept verbatim under **Said to Bee**
+- *"bee todo follow up on the MBR"* → todo #N, flagged 🐝 explicit
+- *"bee remember the agreed layout"* → kept verbatim under **Said to Bee**
 - *"bee note ..."* / *"bee follow up ..."* → same
 
 ## Environment variables
