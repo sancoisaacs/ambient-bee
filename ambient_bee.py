@@ -41,10 +41,7 @@ BOOTSTRAP    = (
 AUDIO_EXTENSIONS = {".m4a", ".wav", ".mp3", ".3ga", ".ogg"}
 
 POSSIBLE_RECORD_DIRS = [
-    Path("/storage/emulated/0/Recordings"),
-    Path("/storage/emulated/0/SamsungVoiceRecorder"),
     Path("/storage/emulated/0/Voice Recorder"),
-    Path("/storage/emulated/0/Download"),
 ]
 
 MEMORY_DIR = Path("/storage/emulated/0/Download/_AMBIENT_MEMORY")
