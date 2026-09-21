@@ -25,16 +25,54 @@ an Obsidian vault is regenerated from it, and you can *talk to it*.
 
 ```bash
 termux-setup-storage
-pkg update && pkg install python git -y
+pkg update && pkg install python git ffmpeg -y
 cp ambient_bee.py ~/ambient_bee.py
-echo 'export MISTRAL_API_KEY=your_key' >> ~/.bashrc && source ~/.bashrc
-python ~/ambient_bee.py --setup          # deps, rclone check, 3 cron jobs, 5 widgets
-python ~/ambient_bee.py --migrate-v2 /storage/emulated/0/Download/_AMBIENT_MEMORY   # optional
+echo 'export MISTRAL_API_KEY=your_key' >> ~/.bashrc
+source ~/.bashrc
+```
+
+### faster-whisper on Termux / Android
+
+The Whisper installation uses a local PyAV build and installs `faster-whisper` without pip dependency resolution.
+
+```bash
+pip install "Cython<3.0"
+pip install av --no-binary av
+pip install faster-whisper==1.2.1 --no-deps
+```
+
+Verify:
+
+```bash
+python -c "import av; print('PyAV:', av.__version__)"
+python -c "import faster_whisper; print('faster-whisper: OK')"
+```
+
+Then run the normal Ambient Bee setup:
+
+```bash
+python ~/ambient_bee.py --setup
+```
+
+`--setup` checks the existing Android-compatible installation and will not replace it with the normal `pip install faster-whisper` resolver path.
+
+Do not replace the working commands above with:
+
+```bash
+pip install faster-whisper
+```
+
+The normal resolver attempts to install `ctranslate2` and other dependencies independently and can fail on Python 3.14 / ARM64 Android.
+
+Optional v2 migration:
+
+```bash
+python ~/ambient_bee.py --migrate-v2 /storage/emulated/0/Download/_AMBIENT_MEMORY
 ```
 
 ## Layout
 
-```
+```text
 /storage/emulated/0/Download/AmbientBee/
 ├── bee.db                 ← source of truth (also mirrored to Drive /_db)
 ├── _done/                 ← processed audio, safe to delete
@@ -50,7 +88,7 @@ Override with `export BEE_HOME=/some/path`.
 
 ## Commands
 
-```
+```text
 --run-once        ingest new audio → retry failures → rebuild vault → rclone sync → notify
 --watch           same, continuously
 --ask "q"         "what did I promise Rob"  (add --speak for TTS)
@@ -63,7 +101,7 @@ Override with `export BEE_HOME=/some/path`.
 
 ## Cron (added by --setup)
 
-```
+```text
 0 1  * * *  python ~/ambient_bee.py --run-once
 30 6 * * *  python ~/ambient_bee.py --brief --notify
 0 18 * * 0  python ~/ambient_bee.py --digest
@@ -84,7 +122,7 @@ Regex is lenient about "hey bee", commas, and pauses.
 
 ## Morning flow
 
-```
+```text
 06:30  notification: "3 recordings yesterday · 5 open todos"
        tap ☀️ Brief → phone reads it to you
        tap ❓ Ask Bee → "what did Rob ask for" → answered from memory
@@ -94,55 +132,57 @@ Or open Claude with Drive MCP → `vault/Daily/YYYY-MM-DD.md` — still works, n
 
 ## Env vars
 
-| var | default |
-|---|---|
-| `MISTRAL_API_KEY` | — |
-| `BEE_MODEL` | `mistralai/mistral-large-2512` |
-| `BEE_BASE_URL` | xkiro endpoint |
-| `BEE_WHISPER_MODEL` | `small` (use `tiny.en` if slow) |
-| `BEE_GDRIVE_REMOTE` | `gdrive:AmbientBee` |
-| `BEE_HOME` | `/storage/emulated/0/Download/AmbientBee` |
-
-## Troubleshooting
-
-- **Whisper slow** → `export BEE_WHISPER_MODEL=tiny.en`
-- **File keeps failing** → `--stats` shows attempts; after 3 it's skipped. Fix key/network, then `sqlite3 bee.db "UPDATE recordings SET attempts=0 WHERE status='failed'"`
-- **Vault looks wrong** → `--rebuild` (DB is truth, vault is disposable)
-- **rclone auth expired** → `rclone config reconnect gdrive:`
-- **Note: `rclone sync` mirrors vault → Drive (deletes remote files not in vault). DB goes to `.../_db` via copy.**
-1 AM:  cron triggers --run-once
-       → transcribe all new files (Whisper, local, offline)
-       → extract memory/todos (Mistral API)
-       → append to /Download/_AMBIENT_MEMORY/YYYY-MM-DD.md
-       → rclone sync → gdrive:AmbientBee/
-       → move audio → /Download/_AMBIENT_DONE/
-       → termux-notification "X recordings processed"
-
-Morning: open Claude → "summarise my Ambient Bee log from last night"
-         → Drive MCP reads the .md → done
+```text
+MISTRAL_API_KEY        required for LLM extraction
+BEE_MODEL              default: mistralai/mistral-large-2512
+BEE_BASE_URL           default: https://api.xkiro.com/v1/chat/completions
+BEE_WHISPER_MODEL      default: small
+BEE_GDRIVE_REMOTE      default: gdrive:AmbientBee
+BEE_HOME               default: /storage/emulated/0/Download/AmbientBee
 ```
 
----
-
-## File locations
-
-| Path | What |
-|------|------|
-| `/storage/emulated/0/Download/_AMBIENT_MEMORY/` | Daily `.md` logs |
-| `/storage/emulated/0/Download/_AMBIENT_DONE/` | Processed audio (safe to delete) |
-| `gdrive:AmbientBee/` | Mirror in Google Drive |
-| `~/.shortcuts/` | Termux widget scripts |
-
----
-
 ## Troubleshooting
 
-**"No recordings folder found"** — open Samsung Voice Recorder and make one recording first; the folder only exists after first use.
+**Whisper slow** → `export BEE_WHISPER_MODEL=tiny.en`
 
-**Whisper very slow** — switch to `tiny.en`. First run downloads the model (~150MB for small).
+**Whisper install fails on Android/Python 3.14** → use the Termux installation sequence in the Install section exactly:
 
-**rclone auth expired** — run `rclone config reconnect gdrive:` to refresh OAuth.
+```bash
+pip install "Cython<3.0"
+pip install av --no-binary av
+pip install faster-whisper==1.2.1 --no-deps
+```
 
-**Cron not running** — check `sv status crond`; if down, `sv up crond`.
+**Do not run `pip install faster-whisper` afterward**, because that invokes the normal dependency resolver again.
 
-**Termux killed overnight** — acquire wake lock: `termux-wake-lock` before long runs (--run-once does this automatically).
+**No recordings found** → record once in Samsung Voice Recorder; Bee searches the known recording locations.
+
+**Mistral errors** → check `echo $MISTRAL_API_KEY`.
+
+**Drive not syncing** → `rclone config` → create the `gdrive` remote.
+
+**Cron not running** → `sv-enable crond && sv up crond`.
+
+**Rebuild Markdown** → `python ~/ambient_bee.py --rebuild`.
+
+## Architecture
+
+```text
+Samsung Voice Recorder
+        ↓
+     audio file
+        ↓
+   faster-whisper
+        ↓
+ transcript + diarization
+        ↓
+      Mistral
+        ↓
+      SQLite
+        ↓
+   Obsidian vault
+        ↓
+      rclone
+```
+
+SQLite remains the source of truth. Markdown is a regenerated view rebuilt from the database.
