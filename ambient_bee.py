@@ -3,7 +3,7 @@
 ambient_bee.py v3 — ambient memory with a brain (Termux + Google Drive)
 ────────────────────────────────────────────────────────────────────────
 Hardware:  Beats Flex (neck mic) + Samsung Voice Recorder + Termux
-Pipeline:  recording → faster-whisper → Mistral → SQLite → Obsidian vault → rclone
+Pipeline:  recording → FFmpeg → whisper.cpp server → Mistral → SQLite → Obsidian vault → rclone
 
     python ambient_bee.py --setup            check/install deps, cron, widgets
     python ambient_bee.py --run-once         ingest new audio, retry failures, rebuild vault, sync
@@ -28,7 +28,11 @@ from collections import Counter
 API_KEY   = os.getenv("MISTRAL_API_KEY", "")
 MODEL     = os.getenv("BEE_MODEL", "mistralai/mistral-large-2512")
 BASE_URL  = os.getenv("BEE_BASE_URL", "https://api.xkiro.com/v1/chat/completions")
-WHISPER_MODEL_SIZE = os.getenv("BEE_WHISPER_MODEL", "small")
+WHISPER_MODEL_SIZE = os.getenv("BEE_WHISPER_MODEL", "tiny.en")
+WHISPER_SERVER_BIN = Path(os.getenv("BEE_WHISPER_SERVER", str(Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-server")))
+WHISPER_MODEL_PATH = Path(os.getenv("BEE_WHISPER_MODEL_PATH", str(Path.home() / "whisper.cpp" / "models" / "ggml-tiny.en.bin")))
+WHISPER_HOST = os.getenv("BEE_WHISPER_HOST", "127.0.0.1")
+WHISPER_PORT = int(os.getenv("BEE_WHISPER_PORT", "8080"))
 GDRIVE_REMOTE      = os.getenv("BEE_GDRIVE_REMOTE", "gdrive:AmbientBee")
 
 BEE_HOME   = Path(os.getenv("BEE_HOME", "/storage/emulated/0/Download/AmbientBee"))
@@ -167,12 +171,12 @@ def _imp(name):
     except ImportError: return False
 
 DEPS = {
-    "termux-api":     (lambda: shutil.which("termux-notification") is not None, "pkg install termux-api -y",  "notifications, wake lock, TTS"),
-    "ffmpeg":         (lambda: shutil.which("ffmpeg") is not None,              "pkg install ffmpeg -y",      "audio decode for whisper"),
-    "rclone":         (lambda: shutil.which("rclone") is not None,              "pkg install rclone -y",      "Drive sync"),
-    "cronie":         (lambda: shutil.which("crond") is not None,               "pkg install cronie termux-services -y", "scheduled runs"),
-    "faster-whisper": (lambda: _imp("faster_whisper"),                          "pip install faster-whisper", "local transcription"),
-    "requests":       (lambda: _imp("requests"),                                "pip install requests",       "LLM API"),
+    "termux-api": (lambda: shutil.which("termux-notification") is not None, "pkg install termux-api -y", "notifications, wake lock, TTS"),
+    "ffmpeg":     (lambda: shutil.which("ffmpeg") is not None, "pkg install ffmpeg -y", "audio normalization for whisper.cpp"),
+    "whisper.cpp": (lambda: WHISPER_SERVER_BIN.exists() and WHISPER_MODEL_PATH.exists(), "build/install whisper.cpp server + model", "local transcription"),
+    "rclone":     (lambda: shutil.which("rclone") is not None, "pkg install rclone -y", "Drive sync"),
+    "cronie":     (lambda: shutil.which("crond") is not None, "pkg install cronie termux-services -y", "scheduled runs"),
+    "requests":   (lambda: _imp("requests"), "pip install requests", "Whisper server + LLM HTTP API"),
 }
 
 def check_deps(auto_install=False):
@@ -249,39 +253,116 @@ def _check_widgets():
 
 # ── TRANSCRIPTION ─────────────────────────────────────────────────────────────
 
-_whisper = None
-def _get_whisper():
-    global _whisper
-    if _whisper is None:
-        try:
-            from faster_whisper import WhisperModel
-            pr(f"Loading Whisper ({WHISPER_MODEL_SIZE})...", "dim")
-            _whisper = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
-        except ImportError:
-            pr("faster-whisper missing — run --setup", "err"); sys.exit(1)
-    return _whisper
+_whisper_server = None
+
+
+def _whisper_url(path=""):
+    return f"http://{WHISPER_HOST}:{WHISPER_PORT}{path}"
+
+
+def _whisper_server_ready():
+    try:
+        import requests as req
+        r = req.get(_whisper_url("/"), timeout=2)
+        return r.ok and "Whisper.cpp Server" in r.text
+    except Exception:
+        return False
+
+
+def _start_whisper_server():
+    """Start the native whisper.cpp HTTP server if it is not already running."""
+    global _whisper_server
+    if _whisper_server_ready():
+        pr(f"Whisper.cpp already running on {WHISPER_HOST}:{WHISPER_PORT}", "dim")
+        return False
+    if not WHISPER_SERVER_BIN.exists():
+        raise RuntimeError(f"whisper-server not found: {WHISPER_SERVER_BIN}")
+    if not WHISPER_MODEL_PATH.exists():
+        raise RuntimeError(f"Whisper model not found: {WHISPER_MODEL_PATH}")
+    pr(f"Starting whisper.cpp ({WHISPER_MODEL_PATH.name})...", "dim")
+    _whisper_server = subprocess.Popen(
+        [str(WHISPER_SERVER_BIN), "-m", str(WHISPER_MODEL_PATH),
+         "--host", WHISPER_HOST, "--port", str(WHISPER_PORT)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+    )
+    for _ in range(30):
+        if _whisper_server_ready():
+            pr(f"Whisper.cpp ready on {WHISPER_HOST}:{WHISPER_PORT}", "ok")
+            return True
+        if _whisper_server.poll() is not None:
+            raise RuntimeError("whisper-server exited while starting")
+        time.sleep(0.5)
+    _stop_whisper_server()
+    raise RuntimeError("Timed out waiting for whisper-server")
+
+
+def _stop_whisper_server():
+    """Stop only the whisper.cpp server started by Ambient Bee."""
+    global _whisper_server
+    if _whisper_server is not None:
+        if _whisper_server.poll() is None:
+            _whisper_server.terminate()
+            try:
+                _whisper_server.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _whisper_server.kill()
+                _whisper_server.wait(timeout=2)
+        _whisper_server = None
+
+
+def _normalize_audio(audio_path: Path):
+    """Convert source audio to 16 kHz mono PCM WAV for whisper.cpp."""
+    import tempfile
+    fd, tmp_name = tempfile.mkstemp(prefix="bee_", suffix=".wav", dir=str(BEE_HOME))
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        r = subprocess.run(["ffmpeg", "-y", "-i", str(audio_path), "-ar", "16000", "-ac", "1",
+                            "-c:a", "pcm_s16le", str(tmp)], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {r.stderr[-500:]}")
+        return tmp
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
 
 def transcribe(audio_path: Path):
-    """Single Whisper pass → (clean_text, diarized_text, duration_s). No double decode."""
-    model = _get_whisper()
-    segments, info = model.transcribe(
-        str(audio_path), language="en", beam_size=5, vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=800, speech_pad_ms=400, threshold=0.5),
-        condition_on_previous_text=False, no_speech_threshold=0.6,
-        compression_ratio_threshold=2.4, log_prob_threshold=-1.0)
+    """Single Whisper pass via native whisper.cpp → (clean_text, diarized_text, duration_s)."""
+    import requests as req
+    _start_whisper_server()
+    wav = _normalize_audio(audio_path)
+    try:
+        with wav.open("rb") as fh:
+            r = req.post(
+                _whisper_url("/inference"),
+                files={"file": (wav.name, fh, "audio/wav")},
+                data={"temperature": "0.0", "response_format": "verbose_json"},
+                timeout=max(120, int(os.getenv("BEE_WHISPER_TIMEOUT", "900"))),
+            )
+        if not r.ok:
+            raise RuntimeError(f"whisper.cpp HTTP {r.status_code}: {r.text[:500]}")
+        result = r.json()
+    finally:
+        wav.unlink(missing_ok=True)
+
     clean, dia = [], []
     spk, last_end = 0, 0.0
-    for seg in segments:
-        txt = seg.text.strip()
+    for seg in result.get("segments", []) or []:
+        txt = str(seg.get("text", "")).strip()
+        start = float(seg.get("start", 0) or 0)
+        end = float(seg.get("end", start) or start)
+        no_speech = float(seg.get("no_speech_prob", 0) or 0)
         if len(txt) < 4 or txt.lower() in HALLUCINATIONS: continue
-        if seg.no_speech_prob > 0.7 or seg.end - seg.start < 0.5: continue
-        if seg.start - last_end > 1.2: spk = 1 - spk
-        clean.append(txt); dia.append(f"[S{spk+1} {seg.start:.1f}s] {txt}"); last_end = seg.end
-    text = " ".join(clean)
+        if no_speech > 0.7 or end - start < 0.5: continue
+        if start - last_end > 1.2: spk = 1 - spk
+        clean.append(txt); dia.append(f"[S{spk+1} {start:.1f}s] {txt}"); last_end = end
+    text = " ".join(clean).strip()
     words = text.lower().split()
     if len(words) > 10 and len(set(words)) < 3:
         text, dia = "", []
-    return text, "\n".join(dia), float(getattr(info, "duration", 0) or 0)
+    duration = float(result.get("duration", 0) or 0)
+    return text, "\n".join(dia), duration
 
 def extract_wake_notes(text):
     """'bee todo call Rob about egress' → [('todo','call Rob about egress')]"""
@@ -397,4 +478,238 @@ def build_vault(con, days=None):
 
     # Index
     stats = con.execute("SELECT count(*) n, sum(duration_s) d FROM recordings WHERE status='ok'").fetchone()
-    open_n = con.execute("SELECT count(*) FROM todos WHERE done_at IS NULL").fetchone
+    open_n = con.execute("SELECT count(*) FROM todos WHERE done_at IS NULL").fetchone()[0]
+    idx = ["# 🐝 Ambient Bee", "", f"{stats['n'] or 0} recordings · {(stats['d'] or 0)/3600:.1f} h captured · {open_n} open todos",
+           "", "- [[Todos]]", "- Daily: " + " · ".join(f"[[Daily/{d}|{d}]]" for d in sorted(by_day)[-14:][::-1]),
+           "- People: " + " · ".join(_link(p["name"]) for p in con.execute("SELECT name FROM people ORDER BY mentions DESC LIMIT 25")),
+           "- Weekly: " + " · ".join(f"[[Weekly/{f.stem}|{f.stem}]]" for f in sorted((VAULT_DIR / 'Weekly').glob('*.md'))[::-1][:8])]
+    (VAULT_DIR / "Index.md").write_text("\n".join(idx), encoding="utf-8")
+
+# ── BRIEF / DIGEST / TODOS ────────────────────────────────────────────────────
+
+def brief(con, speak=False, notify=False):
+    y = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    recs = con.execute("SELECT r.recorded_at, m.summary, m.decisions FROM recordings r JOIN memories m ON m.rec_id=r.id "
+                       "WHERE r.recorded_at LIKE ? ORDER BY r.recorded_at", (y + "%",)).fetchall()
+    todos = con.execute("SELECT id,text,created FROM todos WHERE done_at IS NULL ORDER BY explicit DESC, created DESC LIMIT 12").fetchall()
+    out = [f"☀️ Brief — {datetime.now():%a %d %b}", ""]
+    if recs:
+        out += [f"Yesterday ({len(recs)} recordings):"] + [f"  • {r['summary']}" for r in recs if r["summary"]]
+        dec = [d for r in recs for d in _j(r["decisions"])]
+        if dec: out += ["", "Decided:"] + [f"  • {d}" for d in dec]
+    else:
+        out += ["Yesterday: nothing captured."]
+    out += ["", f"Open todos ({len(todos)}):"] + [f"  • #{t['id']} {t['text']}" for t in todos]
+    text = "\n".join(out); print(text)
+    if notify: _notify("☀️ Bee brief", f"{len(recs)} recordings yesterday · {len(todos)} open todos")
+    if speak: _speak(re.sub(r"[•#☀️]", "", text))
+    return text
+
+def digest(con):
+    iso = datetime.now().isocalendar(); tag = f"{iso[0]}-W{iso[1]:02d}"
+    start = (datetime.now() - timedelta(days=datetime.now().weekday())).strftime("%Y-%m-%d")
+    recs = con.execute("SELECT r.recorded_at, m.summary, m.decisions, m.people, m.todos FROM recordings r JOIN memories m "
+                       "ON m.rec_id=r.id WHERE r.recorded_at >= ? ORDER BY r.recorded_at", (start,)).fetchall()
+    if not recs: pr("Nothing this week", "warn"); return
+    src = "\n".join(f"({r['recorded_at'][:10]}) {r['summary']} | decisions={r['decisions']} | people={r['people']}" for r in recs)
+    body = llm(DIGEST_PROMPT, src, json_mode=False)
+    (VAULT_DIR / "Weekly").mkdir(parents=True, exist_ok=True)
+    (VAULT_DIR / "Weekly" / f"{tag}.md").write_text(f"# Week {tag}\n\n{body}\n", encoding="utf-8")
+    pr(f"Weekly/{tag}.md written", "ok"); print(body)
+
+def list_todos(con):
+    rows = con.execute("SELECT id,text,created,explicit FROM todos WHERE done_at IS NULL ORDER BY explicit DESC, created DESC").fetchall()
+    if not rows: print("No open todos 🎉"); return
+    for t in rows: print(f"#{t['id']:<4} {'🐝 ' if t['explicit'] else ''}{t['text']}  ({t['created']})")
+
+def done_todo(con, tid):
+    con.execute("UPDATE todos SET done_at=? WHERE id=?", (datetime.now().strftime("%Y-%m-%d"), tid)); con.commit()
+    pr(f"#{tid} closed", "ok")
+
+def stats(con):
+    r = con.execute("SELECT count(*) n, sum(duration_s) d, sum(status='failed') f FROM recordings").fetchone()
+    t = con.execute("SELECT sum(done_at IS NULL) o, sum(done_at IS NOT NULL) c FROM todos").fetchone()
+    runs = con.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 5").fetchall()
+    print(f"recordings {r['n']}  ({(r['d'] or 0)/3600:.1f} h audio)  failed {r['f'] or 0}")
+    print(f"todos open {t['o'] or 0}  closed {t['c'] or 0}")
+    print(f"people {con.execute('SELECT count(*) FROM people').fetchone()[0]}")
+    for x in runs:
+        print(f"run {x['started'][:16]}  files={x['files']} ok={x['ok']} failed={x['failed']}  whisper={x['whisper_s']:.0f}s llm={x['llm_s']:.0f}s")
+
+# ── FILES / SYNC ──────────────────────────────────────────────────────────────
+
+def _find_recordings_dir():
+    for p in POSSIBLE_RECORD_DIRS:
+        try:
+            if p.exists() and any(True for _ in p.iterdir()): return p
+        except PermissionError: continue
+    return None
+
+def _stable(f: Path, wait=2):
+    try:
+        s1 = f.stat().st_size; time.sleep(wait); return s1 == f.stat().st_size and s1 > 5000
+    except Exception: return False
+
+def _recorded_at(f: Path):
+    m = re.search(r"(20\d{2})[-_]?(\d{2})[-_]?(\d{2})[-_ T]?(\d{2})[-_:]?(\d{2})", f.name)
+    if m:
+        try: return datetime(*map(int, m.groups())).strftime("%Y-%m-%dT%H:%M")
+        except ValueError: pass
+    return datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%dT%H:%M")
+
+def sync_to_drive():
+    if not shutil.which("rclone"): pr("rclone missing — skip sync", "warn"); return False
+    r = subprocess.run(["rclone", "sync", str(VAULT_DIR), GDRIVE_REMOTE, "--fast-list"], capture_output=True, text=True)
+    r2 = subprocess.run(["rclone", "copy", str(DB_PATH), GDRIVE_REMOTE.rsplit("/", 1)[0] + "/_db", "--update"], capture_output=True, text=True)
+    ok = r.returncode == 0
+    pr(f"Synced vault → {GDRIVE_REMOTE}" if ok else f"Sync failed: {r.stderr.strip()[:200]}", "ok" if ok else "err")
+    return ok
+
+# ── CORE PROCESSING ───────────────────────────────────────────────────────────
+
+def process_file(con, audio_path: Path, timers):
+    rec_at = _recorded_at(audio_path)
+    pr(f"{audio_path.name} ({audio_path.stat().st_size/1e6:.1f} MB, recorded {rec_at})", "head")
+    cur = con.execute("INSERT INTO recordings(file,recorded_at,status,attempts) VALUES(?,?,?,0) "
+                      "ON CONFLICT(file) DO UPDATE SET attempts=attempts+1 RETURNING id", (audio_path.name, rec_at, "processing"))
+    rec_id = cur.fetchone()[0]; con.commit()
+    try:
+        t0 = time.time(); text, dia, dur = transcribe(audio_path); timers["whisper"] += time.time() - t0
+        if len(text.strip()) < 10:
+            con.execute("UPDATE recordings SET status='silent', processed_at=?, duration_s=? WHERE id=?",
+                        (datetime.now().isoformat(timespec="minutes"), dur, rec_id)); con.commit()
+            pr("silence — skipped", "dim"); _move_done(audio_path); return False
+        notes = extract_wake_notes(text)
+        prompt = (dia or text)[:9000]
+        if notes: prompt = "EXPLICIT NOTES:\n" + "\n".join(f"- {k}: {b}" for k, b in notes) + "\n\nTRANSCRIPT:\n" + prompt
+        t0 = time.time(); mem = llm(SYSTEM_PROMPT, prompt); timers["llm"] += time.time() - t0
+        if "error" in mem: raise RuntimeError(mem["error"])
+        con.execute("UPDATE recordings SET status='ok', processed_at=?, duration_s=?, chars=?, transcript=?, diarized=?, explicit_notes=?, error=NULL WHERE id=?",
+                    (datetime.now().isoformat(timespec="minutes"), dur, len(text), text, dia, json.dumps(notes), rec_id))
+        store_memory(con, rec_id, rec_at, mem, notes)
+        pr(f"{mem.get('summary','')[:110]}", "ok")
+        if notes: pr(f"{len(notes)} explicit bee note(s) captured", "ok")
+        _move_done(audio_path); return True
+    except Exception as e:
+        con.execute("UPDATE recordings SET status='failed', error=? WHERE id=?", (str(e)[:500], rec_id)); con.commit()
+        pr(f"failed (will retry next run): {e}", "err"); return False
+
+def _move_done(p: Path):
+    DONE_DIR.mkdir(parents=True, exist_ok=True)
+    try: shutil.move(str(p), str(DONE_DIR / p.name))
+    except Exception as e: pr(f"could not move {p.name}: {e}", "warn")
+
+def retry_failed(con, timers):
+    """Files that failed at the LLM step still sit in the recordings dir (never moved) → picked up again naturally.
+    Failed rows with attempts>=3 are left alone and flagged in --stats."""
+    n = con.execute("SELECT count(*) FROM recordings WHERE status='failed' AND attempts>=3").fetchone()[0]
+    if n: pr(f"{n} file(s) permanently failed after 3 attempts — see --stats", "warn")
+
+def run_once():
+    con = db(); _wake_lock(True)
+    server_started = False
+    started = datetime.now().isoformat(timespec="seconds"); timers = {"whisper": 0.0, "llm": 0.0}
+    try:
+        server_started = _start_whisper_server()
+        rd = _find_recordings_dir()
+        if not rd: pr("No recordings folder", "err"); return
+        skip = {r[0] for r in con.execute("SELECT file FROM recordings WHERE status='failed' AND attempts>=3")}
+        files = sorted(f for f in rd.glob("*.*") if f.suffix.lower() in AUDIO_EXTENSIONS and f.is_file() and f.name not in skip)
+        ok = fail = 0
+        if files:
+            pr(f"{len(files)} file(s) to process", "head"); print()
+            for f in files:
+                if not _stable(f): continue
+                if process_file(con, f, timers): ok += 1
+                else: fail += 1
+                print()
+        else:
+            pr("No new audio", "dim")
+        retry_failed(con, timers)
+        build_vault(con); pr("Vault rebuilt", "ok")
+        sync_to_drive()
+        con.execute("INSERT INTO runs(started,finished,files,ok,failed,whisper_s,llm_s) VALUES(?,?,?,?,?,?,?)",
+                    (started, datetime.now().isoformat(timespec="seconds"), len(files), ok, fail, timers["whisper"], timers["llm"]))
+        con.commit()
+        open_n = con.execute("SELECT count(*) FROM todos WHERE done_at IS NULL").fetchone()[0]
+        _notify("🐝 Ambient Bee", f"{ok}/{len(files)} processed · {open_n} open todos")
+    finally:
+        if server_started: _stop_whisper_server()
+        _wake_lock(False)
+
+def watch_loop():
+    con = db(); _wake_lock(True)
+    server_started = False
+    rd = _find_recordings_dir() or POSSIBLE_RECORD_DIRS[0]
+    server_started = _start_whisper_server()
+    pr(f"Watching {rd}  (Ctrl+C to stop)", "head")
+    seen = {p.name for p in rd.glob("*.*")}
+    try:
+        while True:
+            for f in rd.glob("*.*"):
+                if f.name not in seen and f.suffix.lower() in AUDIO_EXTENSIONS and _stable(f):
+                    process_file(con, f, {"whisper": 0.0, "llm": 0.0}); build_vault(con, days={_recorded_at(f)[:10]}); sync_to_drive(); seen.add(f.name)
+            time.sleep(5)
+    except KeyboardInterrupt:
+        pr("stopped", "ok")
+    finally:
+        if server_started: _stop_whisper_server()
+        _wake_lock(False)
+
+# ── MIGRATION FROM v2 ─────────────────────────────────────────────────────────
+
+def migrate_v2(old_dir: Path):
+    """Import v2 _AMBIENT_MEMORY/*.md logs into the DB so nothing is lost."""
+    con = db(); n = 0
+    for md in sorted(old_dir.glob("*.md")):
+        day = md.stem
+        for block in md.read_text(encoding="utf-8").split("\n## ")[1:]:
+            head, _, rest = block.partition("\n")
+            m = re.match(r"(\d{2}:\d{2}) — (.+)", head.strip())
+            if not m: continue
+            ts, fname = m.groups()
+            tr = re.search(r"\*\*Transcript:\*\*\n(.*?)\n\n", rest, re.S)
+            js = re.search(r"```json\n(.*?)\n```", rest, re.S)
+            try: mem = json.loads(js.group(1)) if js else {}
+            except Exception: mem = {}
+            cur = con.execute("INSERT OR IGNORE INTO recordings(file,recorded_at,processed_at,status,transcript,chars,explicit_notes) VALUES(?,?,?,?,?,?,'[]')",
+                              (fname, f"{day}T{ts}", f"{day}T{ts}", "ok", tr.group(1) if tr else "", len(tr.group(1)) if tr else 0))
+            rid = con.execute("SELECT id FROM recordings WHERE file=?", (fname,)).fetchone()[0]
+            if mem and "error" not in mem: store_memory(con, rid, f"{day}T{ts}", mem, [])
+            n += 1
+    build_vault(con); pr(f"Imported {n} v2 entries → vault rebuilt", "ok")
+
+# ── ENTRYPOINT ────────────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(description="🐝 Ambient Bee v3", formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog=textwrap.dedent(__doc__.split("Hardware")[0]))
+    p.add_argument("--setup", action="store_true"); p.add_argument("--check", action="store_true")
+    p.add_argument("--run-once", action="store_true"); p.add_argument("--watch", action="store_true")
+    p.add_argument("--transcribe", type=str, metavar="FILE")
+    p.add_argument("--ask", type=str, metavar="QUESTION"); p.add_argument("--brief", action="store_true")
+    p.add_argument("--digest", action="store_true"); p.add_argument("--todos", action="store_true")
+    p.add_argument("--done", type=int, metavar="ID"); p.add_argument("--stats", action="store_true")
+    p.add_argument("--rebuild", action="store_true", help="rebuild vault from DB")
+    p.add_argument("--migrate-v2", type=str, metavar="DIR", help="import old _AMBIENT_MEMORY folder")
+    p.add_argument("--speak", action="store_true"); p.add_argument("--notify", action="store_true")
+    a = p.parse_args()
+    print(f"\n{C['head']}🐝 Ambient Bee v3{C['rst']}\n")
+
+    if a.setup or a.check: check_deps(auto_install=False)
+    elif a.run_once: run_once()
+    elif a.watch: watch_loop()
+    elif a.transcribe:
+        con = db(); process_file(con, Path(a.transcribe), {"whisper": 0.0, "llm": 0.0}); build_vault(con)
+    elif a.ask: ask(db(), a.ask, speak=a.speak)
+    elif a.brief: brief(db(), speak=a.speak, notify=a.notify)
+    elif a.digest: digest(db())
+    elif a.todos: list_todos(db())
+    elif a.done is not None: done_todo(db(), a.done)
+    elif a.stats: stats(db())
+    elif a.rebuild: build_vault(db()); pr("Vault rebuilt", "ok")
+    elif a.migrate_v2: migrate_v2(Path(a.migrate_v2))
+    else: p.print_help()
+
+if __name__ == "__main__":
+    main()
