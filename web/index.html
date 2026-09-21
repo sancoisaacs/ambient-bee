@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#111827">
+<title>🐝 Ambient Bee</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0f14;--card:#121923;--muted:#91a0b5;--text:#edf3fb;--line:#263243;--bee:#f5c542}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px system-ui,-apple-system,sans-serif}
+header{padding:22px 18px 14px;position:sticky;top:0;background:rgba(11,15,20,.94);backdrop-filter:blur(12px);z-index:2}
+h1{margin:0;font-size:25px}header p{margin:5px 0 0;color:var(--muted)}
+main{max-width:900px;margin:auto;padding:10px 14px 50px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:15px}.metric{font-size:25px;font-weight:750}.label{color:var(--muted);font-size:12px;margin-top:3px}
+button,input{font:inherit;border-radius:11px;border:1px solid var(--line);background:#17202c;color:var(--text);padding:10px 12px}
+button{cursor:pointer}button.primary{background:var(--bee);color:#111;border:0;font-weight:700}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}.search{flex:1;min-width:190px}
+section{margin-top:16px}.section-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.item{padding:13px 0;border-bottom:1px solid var(--line)}.item:last-child{border:0}
+.time{color:var(--bee);font-size:12px}.summary{margin-top:4px;line-height:1.45}.small{color:var(--muted);font-size:12px}
+pre{white-space:pre-wrap;word-break:break-word;font:13px ui-monospace,monospace;line-height:1.5}
+.todo{display:flex;gap:10px;align-items:flex-start}.todo button{padding:4px 7px;font-size:12px}
+@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}.grid .card:last-child{grid-column:span 2}}
+</style>
+</head>
+<body>
+<header><h1>🐝 Ambient Bee</h1><p>Ambient memory · local control room</p></header>
+<main>
+<div class="grid">
+  <div class="card"><div class="metric" id="recordings">—</div><div class="label">recordings</div></div>
+  <div class="card"><div class="metric" id="hours">—</div><div class="label">hours captured</div></div>
+  <div class="card"><div class="metric" id="todos">—</div><div class="label">open todos</div></div>
+</div>
+<div class="toolbar">
+  <button class="primary" onclick="runBee()">🐝 Run Bee</button>
+  <button onclick="brief()">☀️ Brief</button>
+  <input class="search" id="q" placeholder="Search your memory…" onkeydown="if(event.key==='Enter')search()">
+  <button onclick="search()">Search</button>
+</div>
+<section><div class="section-title"><h2>Latest</h2><button onclick="load()">↻</button></div><div id="latest" class="card">Loading…</div></section>
+<section><div class="section-title"><h2>Open todos</h2></div><div id="todosBox" class="card">Loading…</div></section>
+<section><div class="section-title"><h2>Search results</h2></div><div id="results" class="card">Search your memory when you need it.</div></section>
+<section><div class="section-title"><h2>Daily log</h2></div><div id="daily" class="card">Select a date from a search result or use the latest log.</div></section>
+</main>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function api(path,opt){const r=await fetch(path,opt);return r.json()}
+async function load(){
+ const s=await api('/api/state');
+ recordings.textContent=s.recordings;hours.textContent=s.hours;todos.textContent=s.open_todos;
+ if(s.latest){latest.innerHTML='<div class="time">'+esc(s.latest.recorded_at)+'</div><div class="summary">'+esc(s.latest.summary||'No summary')+'</div><div class="small">'+esc(s.latest.file)+'</div>';loadDaily(s.latest.recorded_at.slice(0,10))}
+ const ts=await api('/api/todos');todosBox.innerHTML=ts.filter(t=>!t.done_at).slice(0,20).map(t=>'<div class="todo"><button onclick="done('+t.id+')">✓</button><div>'+esc(t.text)+'<div class="small">'+esc(t.created)+'</div></div></div>').join('')||'No open todos 🎉';
+}
+async function done(id){await api('/api/done',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});load()}
+async function runBee(){await api('/api/run',{method:'POST'});alert('🐝 Bee run started. Refresh in a moment.')}
+async function brief(){const x=await api('/api/brief');results.innerHTML='<pre>'+esc(x.text)+'</pre>'}
+async function search(){
+ const q=document.getElementById('q').value.trim();if(!q)return;
+ const rs=await api('/api/search?q='+encodeURIComponent(q));
+ results.innerHTML=rs.map(r=>'<div class="item"><div class="time">'+esc(r.recorded_at)+'</div><div class="summary">'+esc(r.summary||'')+'</div><div class="small">'+esc((r.transcript||'').slice(0,280))+'…</div><button onclick="loadDaily(\''+esc(r.recorded_at.slice(0,10))+'\')">Open day</button></div>').join('')||'Nothing in memory matches that.';
+}
+async function loadDaily(date){const x=await api('/api/daily?date='+encodeURIComponent(date));if(x.markdown)daily.innerHTML='<pre>'+esc(x.markdown)+'</pre>'}
+load();
+</script>
+</body>
+</html>
