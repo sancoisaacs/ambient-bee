@@ -218,3 +218,20 @@ rclone config reconnect gdrive:
 ```
 
 Note: `rclone sync` mirrors vault → Drive and can delete remote files not present in the vault. The database is copied separately to `.../_db`.
+
+
+## Termux:Widget control room
+
+The repository includes a ready-to-copy Termux:Widget launcher at `termux-widget/ambient-bee`.
+
+Install it on Android:
+
+```bash
+mkdir -p ~/.shortcuts
+cp termux-widget/ambient-bee ~/.shortcuts/ambient-bee
+chmod +x ~/.shortcuts/ambient-bee
+```
+
+The widget starts the local `bee_web.py` service when needed, shows Bee state from the SQLite source of truth, and provides quick actions for `--run-once`, `--brief`, `--todos`, memory search, and opening the full web control room.
+
+It is intentionally localhost-only: the widget and web UI do not expose the Bee control room to the network.
