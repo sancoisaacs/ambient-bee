@@ -1,123 +1,115 @@
-# 🐝 Ambient Bee v2
+# 🐝 Ambient Bee v3 — ambient memory with a brain
 
-DIY ambient memory — Beats Flex + Samsung Voice Recorder + Termux + Claude
+v2 was a transcriber that appended to a daily .md. v3 is a **memory system**: everything lands in SQLite,
+an Obsidian vault is regenerated from it, and you can *talk to it*.
 
-**Repo:** https://github.com/sancoisaacs/ambient-bee
+## What changed (v2 → v3)
 
----
+| v2 | v3 |
+|---|---|
+| Append-only daily `.md` | **SQLite** (`bee.db`) as the source of truth; markdown is a *view* rebuilt every run |
+| Whisper ran **twice** per file (transcribe + diarize) | One pass — transcript + diarization from the same segments (~2× faster on phone CPU) |
+| Failed Mistral call → garbage JSON written, file moved to _DONE forever | Failure tracked per file, **auto-retried** up to 3 runs, never lost |
+| Timestamp = when cron ran (1 AM) | Timestamp = **when it was recorded** (parsed from filename, else mtime) |
+| Todos scattered in JSON blobs | **Todo ledger** with IDs, dedup, `--done N`, open/closed |
+| — | **Wake words**: say *"bee todo ..."*, *"bee note ..."*, *"bee remember ..."* into the Flex → captured verbatim, flagged 🐝 |
+| — | **`--ask "..."`**: BM25 search over all memory (zero deps) → LLM answers with dates |
+| — | **`--brief`**: morning brief (yesterday + open todos), cron 06:30, optional TTS + notification |
+| — | **`--digest`**: weekly rollup → `Weekly/2026-W39.md`, cron Sunday 18:00 |
+| — | **People pages** auto-built: `[[Rob]]` → every day Rob was mentioned |
+| — | Obsidian-compatible: frontmatter, `[[wikilinks]]`, `bee/tag` tags, collapsible transcripts |
+| — | `--stats` (audio hours, whisper/LLM seconds per run, failures) |
+| — | `--migrate-v2 DIR` imports your old `_AMBIENT_MEMORY` logs — nothing lost |
 
-## Install (one paste into Termux)
+## Install
 
 ```bash
-pkg install python -y && python -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/sancoisaacs/ambient-bee/main/ambient_bee.py', '/data/data/com.termux/files/home/ambient_bee.py')" && python ~/ambient_bee.py --setup
-```
-
-That's it. Setup handles everything else interactively.
-
----
-
-## First time in Termux (manual alternative)
-
-```bash
-# 1. Give Termux storage access (one-time)
 termux-setup-storage
-
-# 2. Set your API key (add to ~/.bashrc to persist)
-export MISTRAL_API_KEY=your_key_here
-
-# 3. Run setup — checks and installs everything
-python ~/ambient_bee.py --setup
+pkg update && pkg install python git -y
+cp ambient_bee.py ~/ambient_bee.py
+echo 'export MISTRAL_API_KEY=your_key' >> ~/.bashrc && source ~/.bashrc
+python ~/ambient_bee.py --setup          # deps, rclone check, 3 cron jobs, 5 widgets
+python ~/ambient_bee.py --migrate-v2 /storage/emulated/0/Download/_AMBIENT_MEMORY   # optional
 ```
 
-Setup will walk you through:
-- ffmpeg, rclone, termux-api, cronie (pkg)
-- faster-whisper, requests (pip)
-- rclone Google Drive config
-- 1 AM cron job
-- Termux widget shortcuts (~/.shortcuts/)
-
----
-
-## rclone Google Drive (if not done yet)
-
-```bash
-rclone config
-# → n (new remote)
-# → name: gdrive
-# → type: drive (Google Drive)
-# → leave client_id blank → enter
-# → scope: 1 (full access)
-# → follow browser OAuth flow
-```
-
-Test it:
-```bash
-rclone lsd gdrive:
-```
-
----
-
-## Cron (1 AM auto-run)
-
-```bash
-# Enable cron daemon
-sv-enable crond
-sv up crond
-
-# Add job (--setup does this, but manual option:)
-crontab -e
-# Add line:
-# 0 1 * * * python /data/data/com.termux/files/home/ambient_bee.py --run-once
-```
-
----
-
-## Termux Widgets
-
-Install **Termux:Widget** from F-Droid.
-
-`--setup` creates these in `~/.shortcuts/`:
-
-| Widget | Does |
-|--------|------|
-| 🐝 Run Bee | `--run-once`: process + sync + exit |
-| ☁️ Sync Drive | rclone copy to Drive |
-| 📋 Today Log | toast with today's summary |
-| 🗑 Clear Done | wipe _DONE folder |
-
-Long-press home screen → Widgets → Termux Widget → drag to home.
-
----
-
-## Samsung Voice Recorder tips
-
-- Settings → **Record via Bluetooth** → ON
-- This lets Beats Flex be the mic while phone is in pocket/locked
-- Voice Recorder keeps recording through Doze — native app advantage
-
----
-
-## Whisper model sizes (trade speed vs quality)
-
-```bash
-# Faster, smaller — good for clear Beats Flex audio
-export BEE_WHISPER_MODEL=tiny.en
-
-# Balanced — default
-export BEE_WHISPER_MODEL=small
-
-# Better quality, slower on phone CPU
-export BEE_WHISPER_MODEL=base.en
-```
-
-Add to `~/.bashrc` to persist.
-
----
-
-## Daily flow
+## Layout
 
 ```
-Night: phone records ambient audio via Beats Flex
+/storage/emulated/0/Download/AmbientBee/
+├── bee.db                 ← source of truth (also mirrored to Drive /_db)
+├── _done/                 ← processed audio, safe to delete
+└── vault/                 ← open this folder in Obsidian (mobile or desktop via Drive)
+    ├── Index.md
+    ├── Todos.md
+    ├── Daily/2026-09-20.md
+    ├── People/Rob.md
+    └── Weekly/2026-W39.md
+```
+
+Override with `export BEE_HOME=/some/path`.
+
+## Commands
+
+```
+--run-once        ingest new audio → retry failures → rebuild vault → rclone sync → notify
+--watch           same, continuously
+--ask "q"         "what did I promise Rob"  (add --speak for TTS)
+--brief           yesterday + open todos   (--speak / --notify)
+--digest          weekly rollup
+--todos / --done 12
+--stats
+--rebuild         regenerate vault from DB (safe any time)
+```
+
+## Cron (added by --setup)
+
+```
+0 1  * * *  python ~/ambient_bee.py --run-once
+30 6 * * *  python ~/ambient_bee.py --brief --notify
+0 18 * * 0  python ~/ambient_bee.py --digest
+```
+
+## Widgets (added by --setup)
+
+🐝 Run Bee · ☀️ Brief (spoken) · ❓ Ask Bee (speech → answer spoken back) · ✅ Todos · ☁️ Sync
+
+## Wake words
+
+Speak naturally, then:
+- *"bee todo call Ryan about the WBR"* → todo #N, flagged 🐝 explicit, survives even if the LLM summary misses it
+- *"bee remember Misaki wants gucchimi columns first"* → kept verbatim under **Said to Bee**
+- *"bee note ..."* / *"bee follow up ..."* → same
+
+Regex is lenient about "hey bee", commas, and pauses.
+
+## Morning flow
+
+```
+06:30  notification: "3 recordings yesterday · 5 open todos"
+       tap ☀️ Brief → phone reads it to you
+       tap ❓ Ask Bee → "what did Rob ask for" → answered from memory
+```
+
+Or open Claude with Drive MCP → `vault/Daily/YYYY-MM-DD.md` — still works, now much richer.
+
+## Env vars
+
+| var | default |
+|---|---|
+| `MISTRAL_API_KEY` | — |
+| `BEE_MODEL` | `mistralai/mistral-large-2512` |
+| `BEE_BASE_URL` | xkiro endpoint |
+| `BEE_WHISPER_MODEL` | `small` (use `tiny.en` if slow) |
+| `BEE_GDRIVE_REMOTE` | `gdrive:AmbientBee` |
+| `BEE_HOME` | `/storage/emulated/0/Download/AmbientBee` |
+
+## Troubleshooting
+
+- **Whisper slow** → `export BEE_WHISPER_MODEL=tiny.en`
+- **File keeps failing** → `--stats` shows attempts; after 3 it's skipped. Fix key/network, then `sqlite3 bee.db "UPDATE recordings SET attempts=0 WHERE status='failed'"`
+- **Vault looks wrong** → `--rebuild` (DB is truth, vault is disposable)
+- **rclone auth expired** → `rclone config reconnect gdrive:`
+- **Note: `rclone sync` mirrors vault → Drive (deletes remote files not in vault). DB goes to `.../_db` via copy.**
 1 AM:  cron triggers --run-once
        → transcribe all new files (Whisper, local, offline)
        → extract memory/todos (Mistral API)
