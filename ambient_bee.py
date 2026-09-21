@@ -8,7 +8,7 @@ Pipeline:  recording → FFmpeg → whisper.cpp server → Mistral → SQLite �
     python ambient_bee.py --setup            check/install deps, cron, widgets
     python ambient_bee.py --run-once         ingest new audio, retry failures, rebuild vault, sync
     python ambient_bee.py --watch            stay running
-    python ambient_bee.py --ask "what did I promise Rob"
+    python ambient_bee.py --ask "what did I promise Jack"
     python ambient_bee.py --brief            morning brief (yesterday + open todos)
     python ambient_bee.py --digest           weekly rollup → Weekly/YYYY-Www.md
     python ambient_bee.py --todos            open todo ledger
