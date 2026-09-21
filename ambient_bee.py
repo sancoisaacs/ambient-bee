@@ -590,8 +590,8 @@ def main():
         description="🐝 Ambient Bee v2 — DIY ambient memory for Termux",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Use --setup to get started. Repo: https://github.com/sancoisaacs/ambient-bee",
-            Examples:
-              python ambient_bee.py --setup              check & install deps
-              python ambient_bee.py --run-once           process + sync + exit  ← cron/widget
-              python ambient_bee.py --watch              stay running
-              python ambient_bee.py --
+    )
+    parser.add_argument("--setup",      action="store_true", help="Check and install all dependencies")
+    parser.add_argument("--run-once",   action="store_true", help="Process pending files, sync, exit")
+    parser.add_argument("--watch",      action="store_true", help="Watch folder continuously")
+    parser.add_argument("--transcribe", type=str,            help="Transcri
