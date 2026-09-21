@@ -1,0 +1,78 @@
+#!/data/data/com.termux/files/usr/bin/bash
+#
+# Ambient Bee — Termux:Widget control room
+# Put this file at:
+#   ~/.shortcuts/ambient-bee
+#
+# Requires:
+#   Termux:Widget
+#   termux-api
+#
+# The script reads the same bee.db/vault as bee_web.py.
+# It does not expose anything over the network.
+
+BEE="$HOME/ambient_bee.py"
+WEB="$HOME/bee_web.py"
+DB="/storage/emulated/0/Download/AmbientBee/bee.db"
+URL="http://127.0.0.1:8787"
+
+clear
+
+echo "🐝 AMBIENT BEE"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo
+
+# Start the local control room if it is not already running.
+if ! pgrep -f "python.*bee_web.py" >/dev/null 2>&1; then
+    nohup python "$WEB" >/dev/null 2>&1 &
+    sleep 1
+fi
+
+# Pull the live state from Bee itself.
+python "$BEE" --stats 2>/dev/null || true
+
+echo
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "1  🐝 Run Bee"
+echo "2  🧠 Morning Brief"
+echo "3  📋 Todos"
+echo "4  🔎 Search memory"
+echo "5  🌐 Open full control room"
+echo "6  🔄 Refresh"
+echo "q  Exit"
+echo
+
+read -r -p "Bee > " choice
+
+case "$choice" in
+    1)
+        python "$BEE" --run-once
+        ;;
+    2)
+        python "$BEE" --brief
+        ;;
+    3)
+        python "$BEE" --todos
+        ;;
+    4)
+        printf "Search > "
+        read -r query
+        python "$BEE" --ask "$query"
+        ;;
+    5)
+        termux-open-url "$URL"
+        ;;
+    6)
+        exec "$0"
+        ;;
+    q|Q)
+        exit 0
+        ;;
+    *)
+        echo "Unknown option."
+        ;;
+esac
+
+echo
+read -r -p "Press Enter to return to Bee..."
+exec "$0"
